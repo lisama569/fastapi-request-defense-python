@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""服务入口：uvicorn main:app。"""
 
-app = FastAPI()
+from request_defense.app import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
