@@ -57,12 +57,14 @@ def build_audit_record(
     rule_results: list[dict[str, Any]],
     rate_limit: dict[str, Any] | None,
     elapsed_ms: float,
+    policy_version: int = 0,
+    body_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造审计记录（dict）。输入摘要足以复现判定，敏感信息已脱敏。"""
     body = body_summary
     if len(body) > _MAX_BODY_LOG:
         body = body[:_MAX_BODY_LOG] + "...<truncated>"
-    return {
+    record = {
         "event": "request_defense_decision",
         "decision": decision,
         "reason": reason,
@@ -82,6 +84,12 @@ def build_audit_record(
         },
         "elapsed_ms": round(elapsed_ms, 3),
     }
+    if policy_version:
+        record["basis"]["policy_version"] = policy_version
+    if body_meta is not None:
+        # 正文计量：长度/类型/检查范围等，绝不记录完整正文
+        record["input"]["body_meta"] = dict(body_meta)
+    return record
 
 
 def log_decision(record: dict[str, Any]) -> None:

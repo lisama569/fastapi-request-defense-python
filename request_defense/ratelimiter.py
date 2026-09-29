@@ -108,6 +108,31 @@ class SlidingWindowRateLimiter:
             else:
                 self._events.pop(source, None)
 
+    def peek(self, source: str) -> dict:
+        """只读查看某来源当前窗口的配额信息（不占用、不驱逐之外的状态）。
+
+        供规则阶段的审计记录展示：注意会执行驱逐（与 try_acquire 同一推进口径），
+        但不追加时间戳，因此不影响计数。
+        """
+        with self._lock:
+            now_ns = self._clock()
+            dq = self._events.get(source)
+            current = 0
+            retry_after_ms = 0
+            if dq is not None:
+                self._evict(dq, now_ns)
+                current = len(dq)
+                if current >= self.limit and dq:
+                    retry_ns = max(0, (dq[0] + self.window_ns) - now_ns)
+                    retry_after_ms = (retry_ns + 999_999) // 1_000_000
+            return {
+                "allowed": current < self.limit,
+                "remaining": max(0, self.limit - current),
+                "limit": self.limit,
+                "window_ms": self.window_ns // 1_000_000,
+                "retry_after_ms": retry_after_ms,
+            }
+
     def active_sources(self) -> int:
         with self._lock:
             return sum(1 for dq in self._events.values() if dq)

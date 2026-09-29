@@ -25,6 +25,16 @@ class Reason(str, Enum):
     RULE_TIMEOUT = "rule_timeout"
     RULE_LIMIT_EXCEEDED = "rule_limit_exceeded"
     ENGINE_INTERNAL_ERROR = "engine_internal_error"
+    # ---- 带正文入口（POST/PUT/PATCH）专属、与上述原因严格可区分 ---- #
+    # 正文超过接收上限：服务不接受（HTTP 413），与“能收但无法完成内容判定”区分
+    BODY_TOO_LARGE = "body_too_large"
+    # 正文超过内容检查上限：只检查了前 inspect_limit 字节，无法对整体内容下结论
+    # （默认 fail-closed：403；显式放行开关见 BodyPolicy）
+    CONTENT_INSPECTION_INCOMPLETE = "content_inspection_incomplete"
+    # 接收正文超过时间预算：不允许慢发送无界占用连接与在途名额
+    BODY_RECEIVE_TIMEOUT = "body_receive_timeout"
+    # 在途正文容量饱和：并发大请求的有界背压（不拖垮服务、不绕过限流）
+    BODY_CONCURRENCY_LIMITED = "body_concurrency_limited"
 
 
 class RuleVerdict(str, Enum):
@@ -66,6 +76,7 @@ class DefenseDecision:
     detail: str = ""
     elapsed_ms: float = 0.0
     rule_version: int = 0
+    policy_version: int = 0
 
 
 @dataclass(frozen=True, slots=True)

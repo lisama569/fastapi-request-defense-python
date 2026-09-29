@@ -151,6 +151,129 @@ class DefenseEngine:
     # 主入口
     # ------------------------------------------------------------------ #
     def evaluate(self, features: RequestFeatures) -> DefenseDecision:
+        """限流预检 + 规则求值（旧入口，等价于依次调用两个分阶段方法）。"""
+        rate_decision = self.precheck_rate_limit(features)
+        if rate_decision is not None:
+            return rate_decision
+        return self.evaluate_rules(features)
+
+    def precheck_rate_limit(
+        self, features: RequestFeatures, *, policy_version: int = 0
+    ) -> DefenseDecision | None:
+        """来源额度预检（在读正文之前执行）。
+
+        配额耗尽 -> RATE_LIMITED 结论（不进入规则求值、不接收正文）；
+        额度充足 -> 占用一次配额并返回 None，由调用方继续读正文/规则求值。
+        """
+        started = time.perf_counter_ns()
+        version, _rules = self._store.snapshot()
+        rl = self._rl.try_acquire(features.source)
+        rate_info = {
+            "allowed": rl.allowed,
+            "remaining": rl.remaining,
+            "limit": rl.limit,
+            "window_ms": rl.window_ms,
+            "retry_after_ms": rl.retry_after_ms,
+        }
+        if rl.allowed:
+            return None
+        elapsed = (time.perf_counter_ns() - started) / 1e6
+        outcome = DefenseDecision(
+            decision=Decision.RATE_LIMITED,
+            reason=Reason.RATE_LIMIT_QUOTA_EXHAUSTED,
+            source=features.source,
+            detail=f"quota exhausted; retry_after_ms={rl.retry_after_ms}",
+            elapsed_ms=elapsed,
+            rule_version=version,
+        )
+        self._audit(
+            outcome, features, version, results=None,
+            rate_info=rate_info, elapsed_ms=elapsed,
+        )
+        return outcome
+
+    @staticmethod
+    def _audit(
+        outcome: DefenseDecision,
+        features: RequestFeatures,
+        version: int,
+        *,
+        results: list[RuleEvalResult] | None,
+        rate_info: dict | None,
+        elapsed_ms: float,
+        policy_version: int = 0,
+        body_meta: dict | None = None,
+    ) -> None:
+        record = audit.build_audit_record(
+            source=features.source,
+            method=features.method,
+            path=features.path,
+            headers=features.headers,
+            query=features.query,
+            body_summary=features.body_summary,
+            decision=outcome.decision.value,
+            reason=outcome.reason.value,
+            detail=outcome.detail,
+            rule_version=version,
+            rule_results=[
+                {
+                    "rule_id": r.rule_id,
+                    "verdict": r.verdict.value,
+                    "priority": r.priority,
+                    "effect": r.effect.value,
+                    "error_type": r.error_type,
+                    "elapsed_ms": round(r.elapsed_ms, 3),
+                }
+                for r in (results or ())
+            ],
+            rate_limit=rate_info,
+            elapsed_ms=elapsed_ms,
+            policy_version=policy_version,
+            body_meta=body_meta,
+        )
+        audit.log_decision(record)
+
+    def deny_body_stage(
+        self,
+        features: RequestFeatures,
+        reason: Reason,
+        detail: str,
+        *,
+        policy_version: int,
+        body_meta: dict | None = None,
+    ) -> DefenseDecision:
+        """正文接收/容量阶段的拒绝结论：与规则判定走同一审计口径。"""
+        started = time.perf_counter_ns()
+        version, _rules = self._store.snapshot()
+        elapsed = (time.perf_counter_ns() - started) / 1e6
+        outcome = DefenseDecision(
+            decision=Decision.DENY,
+            reason=reason,
+            source=features.source,
+            detail=detail,
+            elapsed_ms=elapsed,
+            rule_version=version,
+            policy_version=policy_version,
+        )
+        self._audit(
+            outcome, features, version, results=None, rate_info=None,
+            elapsed_ms=elapsed, policy_version=policy_version, body_meta=body_meta,
+        )
+        return outcome
+
+    def evaluate_rules(
+        self,
+        features: RequestFeatures,
+        *,
+        policy_version: int = 0,
+        body_meta: dict | None = None,
+        body_rule_scoped: bool = False,
+    ) -> DefenseDecision:
+        """规则组合判定（限流已通过）。整次求值只读取规则快照的不可变元组。
+
+        body_rule_scoped=True 且内容判定开关关闭时，field_name == "body" 的
+        规则不参与本次判定（其余来源/路径/头/查询规则照常）。
+        """
         started = time.perf_counter_ns()
         version, rules = self._store.snapshot()
 
@@ -170,58 +293,31 @@ class DefenseEngine:
                 detail=detail,
                 elapsed_ms=elapsed,
                 rule_version=version,
+                policy_version=policy_version,
             )
-            record = audit.build_audit_record(
-                source=features.source,
-                method=features.method,
-                path=features.path,
-                headers=features.headers,
-                query=features.query,
-                body_summary=features.body_summary,
-                decision=decision.value,
-                reason=reason.value,
-                detail=detail,
-                rule_version=version,
-                rule_results=[
-                    {
-                        "rule_id": r.rule_id,
-                        "verdict": r.verdict.value,
-                        "priority": r.priority,
-                        "effect": r.effect.value,
-                        "error_type": r.error_type,
-                        "elapsed_ms": round(r.elapsed_ms, 3),
-                    }
-                    for r in (results or ())
-                ],
-                rate_limit=rate_info,
-                elapsed_ms=elapsed,
+            self._audit(
+                outcome, features, version, results=results,
+                rate_info=rate_info, elapsed_ms=elapsed,
+                policy_version=policy_version, body_meta=body_meta,
             )
-            audit.log_decision(record)
             return outcome
 
-        # 1) 限流
-        rl = self._rl.try_acquire(features.source)
-        rate_info = {
-            "allowed": rl.allowed,
-            "remaining": rl.remaining,
-            "limit": rl.limit,
-            "window_ms": rl.window_ms,
-            "retry_after_ms": rl.retry_after_ms,
-        }
-        if not rl.allowed:
-            return finish(
-                Decision.RATE_LIMITED,
-                Reason.RATE_LIMIT_QUOTA_EXHAUSTED,
-                f"quota exhausted; retry_after_ms={rl.retry_after_ms}",
-                rate_info=rate_info,
+        # 已在预检阶段占用配额；这里的 rate_info 仅作审计展示
+        rate_info = self._rl.peek(features.source)
+
+        # 内容判定开关关闭：body 字段规则整体不参与（其余规则照常）
+        effective_rules = rules
+        if body_rule_scoped:
+            effective_rules = tuple(
+                r for r in rules if r.config.field_name != "body"
             )
 
         # 2) 规则数量上限（纵深防御；store 在写入侧已拒绝超量规则集）
-        if len(rules) > self._max_rules:
+        if len(effective_rules) > self._max_rules:
             return finish(
                 Decision.DENY,
                 Reason.RULE_LIMIT_EXCEEDED,
-                f"rule count {len(rules)} exceeds max {self._max_rules}",
+                f"rule count {len(effective_rules)} exceeds max {self._max_rules}",
                 rate_info=rate_info,
             )
 
@@ -229,7 +325,7 @@ class DefenseEngine:
         deadline = started + self._timeout_ns
         results: list[RuleEvalResult] = []
         engine_fault = ""
-        for rule in rules:
+        for rule in effective_rules:
             try:
                 results.append(self._eval_one(rule, features, deadline))
             except _EngineBusy as exc:
