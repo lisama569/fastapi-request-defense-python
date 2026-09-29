@@ -25,6 +25,15 @@ class Reason(str, Enum):
     RULE_TIMEOUT = "rule_timeout"
     RULE_LIMIT_EXCEEDED = "rule_limit_exceeded"
     ENGINE_INTERNAL_ERROR = "engine_internal_error"
+    # ---- 带正文入口（POST/PUT/PATCH）相关原因，状态码与语义均相互可区分 ----
+    # 正文超过"接收上限"：不接受，明确拒绝（HTTP 413）
+    BODY_TOO_LARGE = "body_too_large"
+    # 正文未超接收上限、但超过"检查上限"，无法完成内容判定：内容不可判定（HTTP 422）
+    BODY_INSPECTION_INCOMPLETE = "body_inspection_incomplete"
+    # 正文接收超过单请求时间预算（HTTP 408）
+    BODY_RECEIVE_TIMEOUT = "body_receive_timeout"
+    # 并发正文缓冲容量饱和，服务暂时无法安全接收（HTTP 503）
+    BODY_INGRESS_BUSY = "body_ingress_busy"
 
 
 class RuleVerdict(str, Enum):
@@ -53,6 +62,13 @@ class RequestFeatures:
     headers: dict[str, str] = field(default_factory=dict)
     query: dict[str, str] = field(default_factory=dict)
     body_summary: str = ""
+    # ---- 带正文入口（POST/PUT/PATCH）----
+    # 客户端实际发送的正文总字节数（即使超过检查上限也如实记录）
+    body_length: int = 0
+    # 正文检查前缀是否覆盖完整正文（False 表示只检查了前 N 字节，内容判定不可完成）
+    body_fully_inspected: bool = True
+    # 本次处理所依据的内容策略版本（与规则版本一同进入审计，保证可复现）
+    content_policy_version: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +82,7 @@ class DefenseDecision:
     detail: str = ""
     elapsed_ms: float = 0.0
     rule_version: int = 0
+    content_policy_version: int = 0
 
 
 @dataclass(frozen=True, slots=True)

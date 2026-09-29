@@ -1,31 +1,38 @@
-"""FastAPI 应用装配：把防护层挂到各个 HTTP 入口。
+"""FastAPI 应用装配：把防护层挂到各个 HTTP 入口（含带正文入口）。
 
-- 所有非管理入口统一经过防护中间件：限流(429) / 拒绝(403) / 服务故障(500)，
-  结论与原因在响应体、日志、审计中保持一致且可区分；
+- GET 等读入口与 POST/PUT/PATCH 写入口统一经过纯 ASGI 防护中间件：
+  来源限流(429) / 规则拒绝(403) / 正文容量与降级(413/422/408/503) /
+  服务故障(500)，结论与原因在响应体、日志、审计中保持一致且可区分；
+- 写入口在**限流通过后**有界接收正文（接收硬上限 / 检查上限 / 超时 / 并发容量），
+  放行则把与客户端所发完全一致的正文原样回放给业务；任何拒绝都不触达业务；
 - /admin/* 管理接口先过 Bearer 令牌校验，未授权一律 401 固定错误体，
   不泄漏任何内部状态（规则数、版本等）；
-- 规则集写入为"整体校验 + 原子替换"，非法集返回 422 且旧规则继续生效；
+- 规则集与内容策略写入均为"整体校验 + 原子替换"，非法值返回 422 且旧版本继续生效，
+  可在不重启的情况下调整检查上限、接收上限与内容判定开关；
 - /healthz 等运维路径放行，便于存活探测（不消耗限流配额）。
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from typing import Any
+from urllib.parse import parse_qsl
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from python_multipart.multipart import FormParser, parse_options_header
 from pydantic import BaseModel, Field
 
 from .auth import AuthError, authenticate, mask_token
 from .config import DefenseConfig
 from .engine import DefenseEngine
+from .middleware import DefenseASGIMiddleware
+from .policy import ContentPolicy, ContentPolicyStore, ContentPolicyValidationError
 from .ratelimiter import SlidingWindowRateLimiter
 from .store import RuleStore, RuleSetValidationError
 from .types import (
-    Decision,
-    Reason,
-    RequestFeatures,
     RuleConfig,
     RuleEffect,
 )
@@ -36,15 +43,6 @@ logger = logging.getLogger("request_defense")
 _EXEMPT_EXACT = frozenset({"/healthz", "/docs", "/openapi.json", "/redoc"})
 _ADMIN_PREFIX = "/admin"
 _MAX_BODY_SUMMARY_BYTES = 512
-
-# 决策 -> HTTP 状态码
-_STATUS_MAP = {
-    Decision.ALLOW: 200,
-    Decision.RATE_LIMITED: 429,
-    Decision.DENY: 403,
-}
-# 引擎自身故障（区别于规则故障）使用 5xx
-_SERVER_FAULT_REASONS = frozenset({Reason.ENGINE_INTERNAL_ERROR})
 
 
 class RuleIn(BaseModel):
@@ -58,6 +56,12 @@ class RuleIn(BaseModel):
 
 class RuleSetIn(BaseModel):
     rules: list[RuleIn] = Field(min_length=1)
+
+
+class ContentPolicyIn(BaseModel):
+    inspect_limit_bytes: int = Field(gt=0)
+    receive_limit_bytes: int = Field(gt=0)
+    content_check_enabled: bool
 
 
 def _error_body(code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -76,26 +80,56 @@ def _client_source(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-async def _build_features(request: Request) -> RequestFeatures:
-    """抽取请求特征；body 只取定长前缀，避免大请求体无界占用内存。"""
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        if total >= _MAX_BODY_SUMMARY_BYTES:
-            break
-        remaining = _MAX_BODY_SUMMARY_BYTES - total
-        chunks.append(chunk[:remaining])
-        total += min(len(chunk), remaining)
-    body_summary = b"".join(chunks)[:_MAX_BODY_SUMMARY_BYTES].decode("utf-8", "replace")
-    headers = {k.lower(): v for k, v in request.headers.items()}
-    return RequestFeatures(
-        source=_client_source(request),
-        path=request.url.path,
-        method=request.method,
-        headers=headers,
-        query=dict(request.query_params),
-        body_summary=body_summary,
+def _parse_form(raw: bytes, content_type: str) -> dict[str, str]:
+    """解析 urlencoded 表单字段；multipart 仅返回普通字段（文件见 _parse_multipart_files）。"""
+    ctype = content_type.lower()
+    if ctype.startswith("application/x-www-form-urlencoded"):
+        return {
+            k: v for k, v in parse_qsl(raw.decode("utf-8"), keep_blank_values=True)
+        }
+    files, fields = _parse_multipart(raw, content_type)
+    return fields
+
+
+def _parse_multipart_files(raw: bytes, content_type: str) -> list[tuple[str, bytes]]:
+    """从 multipart 正文中提取 (filename, bytes) 列表。"""
+    files, _fields = _parse_multipart(raw, content_type)
+    return files
+
+
+def _parse_multipart(
+    raw: bytes, content_type: str
+) -> tuple[list[tuple[str, bytes]], dict[str, str]]:
+    """用 python-multipart 解析一次性已读入的 multipart 正文。
+
+    返回 (文件列表[(filename, bytes)], 普通字段{name: value})。
+    业务侧仅读取一次原始正文后自行解析，防护层不参与解析过程。
+    """
+    _, options = parse_options_header(content_type.encode("latin-1"))
+    boundary = options.get(b"boundary", b"")
+    files: list[tuple[str, bytes]] = []
+    fields: dict[str, str] = {}
+
+    def on_field(field) -> None:
+        name = (field.field_name or b"").decode("utf-8")
+        fields[name] = field.value.decode("utf-8")
+
+    def on_file(f) -> None:
+        name = (f.field_name or b"").decode("utf-8")
+        # 解析后文件已落内存 BytesIO，读取其完整字节
+        f.file_object.seek(0)
+        data = f.file_object.read()
+        files.append(((f.file_name or name).decode("utf-8"), data))
+
+    parser = FormParser(
+        "multipart/form-data",
+        on_field,
+        on_file,
+        boundary=boundary,
     )
+    parser.write(raw)
+    parser.finalize()
+    return files, fields
 
 
 def create_app(config: DefenseConfig | None = None) -> FastAPI:
@@ -123,53 +157,96 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
         request_timeout_ms=config.request_timeout_ms,
         fail_open=config.fail_open,
     )
+    # 内容策略：启动默认值来自配置；运行时可经管理接口整体原子替换
+    policy_store = ContentPolicyStore(
+        ContentPolicy(
+            inspect_limit_bytes=config.inspect_limit_bytes,
+            receive_limit_bytes=config.receive_limit_bytes,
+            content_check_enabled=config.content_check_enabled,
+        )
+    )
     app.state.config = config
     app.state.engine = engine
     app.state.rate_limiter = rate_limiter
     app.state.rule_store = rule_store
+    app.state.policy_store = policy_store
 
-    # ------------------------- 防护中间件 ------------------------- #
-    @app.middleware("http")
-    async def defense_middleware(request: Request, call_next):
-        path = request.url.path
-        if path in _EXEMPT_EXACT or path.startswith(_ADMIN_PREFIX):
-            return await call_next(request)
-
-        try:
-            features = await _build_features(request)
-            outcome = engine.evaluate(features)
-        except Exception:  # noqa: BLE001 - 装配外的意外统一 500，不泄漏内部细节
-            logger.exception("defense middleware internal failure")
-            return JSONResponse(
-                status_code=500,
-                content=_error_body(
-                    Reason.ENGINE_INTERNAL_ERROR.value,
-                    "internal defense failure",
-                ),
-            )
-
-        if outcome.decision is Decision.ALLOW:
-            return await call_next(request)
-
-        http_status = (
-            500
-            if outcome.reason in _SERVER_FAULT_REASONS
-            else _STATUS_MAP[outcome.decision]
-        )
-        headers: dict[str, str] = {}
-        body: dict[str, Any] = {
-            "error": outcome.reason.value,
-            "message": outcome.detail,
-            "decision": outcome.decision.value,
-            "rule_version": outcome.rule_version,
-            "elapsed_ms": round(outcome.elapsed_ms, 3),
-        }
-        return JSONResponse(status_code=http_status, content=body, headers=headers)
+    # 纯 ASGI 防护中间件：读入口与 POST/PUT/PATCH 走同一套来源额度、
+    # 特征规则、内容接收策略与审计口径；放行后原样回放完整正文。
+    app.add_middleware(
+        DefenseASGIMiddleware,
+        engine=engine,
+        policy_store=policy_store,
+        body_timeout_ms=config.body_timeout_ms,
+        body_ingress_concurrency=config.body_ingress_concurrency,
+        exempt_exact=_EXEMPT_EXACT,
+        admin_prefix=_ADMIN_PREFIX,
+        read_body_summary_bytes=_MAX_BODY_SUMMARY_BYTES,
+    )
 
     # ------------------------- 业务入口（示例） ------------------------- #
     @app.get("/api/echo")
     async def echo(request: Request) -> dict[str, str]:
         return {"path": request.url.path, "status": "served"}
+
+    @app.post("/api/submit/json")
+    async def submit_json(request: Request) -> dict[str, Any]:
+        """JSON 提交入口：防护层放行后业务侧自行解析，正文原样可达。"""
+        raw = await request.body()
+        parsed = json.loads(raw.decode("utf-8"))
+        return {
+            "status": "served",
+            "content_type": request.headers.get("content-type", ""),
+            "length": len(raw),
+            "name": parsed.get("name"),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    @app.post("/api/submit/form")
+    async def submit_form(request: Request) -> dict[str, Any]:
+        """表单（urlencoded / multipart）提交入口：业务侧只读取一次原始正文再自行解析。"""
+        raw = await request.body()
+        ctype = request.headers.get("content-type", "")
+        fields: dict[str, Any] = _parse_form(raw, ctype)
+        return {
+            "status": "served",
+            "content_type": ctype,
+            "length": len(raw),
+            "fields": fields,
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    @app.put("/api/upload/binary")
+    async def upload_binary(request: Request) -> dict[str, Any]:
+        """二进制上传入口：业务侧拿到与客户端所发完全一致的字节与内容类型。"""
+        raw = await request.body()
+        ctype = request.headers.get("content-type", "")
+        files = _parse_multipart_files(raw, ctype)
+        first = files[0] if files else None
+        return {
+            "status": "served",
+            "content_type": ctype,
+            "length": len(raw),
+            "filename": first[0] if first else None,
+            "file_length": len(first[1]) if first else 0,
+            "file_sha256": (
+                hashlib.sha256(first[1]).hexdigest() if first else None
+            ),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    @app.patch("/api/submit/json")
+    async def patch_json(request: Request) -> dict[str, Any]:
+        """PATCH 与 POST 走同一套防护口径与正文回放。"""
+        raw = await request.body()
+        parsed = json.loads(raw.decode("utf-8"))
+        return {
+            "status": "served",
+            "content_type": request.headers.get("content-type", ""),
+            "length": len(raw),
+            "name": parsed.get("name"),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        }
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -252,6 +329,58 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
             )
         logger.info("rule set replaced atomically version=%s", version)
         return {"status": "ok", "version": version, "rule_count": len(payload.rules)}
+
+    # --------------------- 运行时内容策略（无需重启） --------------------- #
+    @app.get(f"{_ADMIN_PREFIX}/content-policy")
+    async def get_content_policy(request: Request):
+        denied = require_admin(request)
+        if denied is not None:
+            return denied
+        version, policy = policy_store.snapshot()
+        return {
+            "version": version,
+            "inspect_limit_bytes": policy.inspect_limit_bytes,
+            "receive_limit_bytes": policy.receive_limit_bytes,
+            "content_check_enabled": policy.content_check_enabled,
+        }
+
+    @app.put(f"{_ADMIN_PREFIX}/content-policy")
+    async def put_content_policy(payload: ContentPolicyIn, request: Request):
+        denied = require_admin(request)
+        if denied is not None:
+            return denied
+        new_policy = ContentPolicy(
+            inspect_limit_bytes=payload.inspect_limit_bytes,
+            receive_limit_bytes=payload.receive_limit_bytes,
+            content_check_enabled=payload.content_check_enabled,
+        )
+        try:
+            version = policy_store.replace(new_policy)
+        except ContentPolicyValidationError as exc:
+            logger.warning(
+                "content policy rejected: %s (field=%s) source=%s",
+                exc,
+                exc.field,
+                _client_source(request),
+            )
+            current = policy_store.snapshot()[0]
+            return JSONResponse(
+                status_code=422,
+                content=_error_body(
+                    "invalid_content_policy",
+                    str(exc),
+                    field=exc.field,
+                    current_version=current,
+                ),
+            )
+        logger.info("content policy replaced atomically version=%s", version)
+        return {
+            "status": "ok",
+            "version": version,
+            "inspect_limit_bytes": new_policy.inspect_limit_bytes,
+            "receive_limit_bytes": new_policy.receive_limit_bytes,
+            "content_check_enabled": new_policy.content_check_enabled,
+        }
 
     return app
 

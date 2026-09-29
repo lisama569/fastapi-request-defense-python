@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -150,75 +151,194 @@ class DefenseEngine:
     # ------------------------------------------------------------------ #
     # 主入口
     # ------------------------------------------------------------------ #
-    def evaluate(self, features: RequestFeatures) -> DefenseDecision:
+    def evaluate(
+        self,
+        features: RequestFeatures,
+        *,
+        content_check_enabled: bool = True,
+    ) -> DefenseDecision:
+        """限流 + 规则组合判定（读请求与已接收正文的写请求共用）。
+
+        保持历史行为：内部先限流后规则求值。带正文入口应在接收正文**之前**
+        调用 ``reserve_quota``，再在接收后调用 ``decide_rules``，避免被
+        限流的请求白白缓冲正文。
+        """
         started = time.perf_counter_ns()
         version, rules = self._store.snapshot()
 
-        def finish(
-            decision: Decision,
-            reason: Reason,
-            detail: str,
-            results: list[RuleEvalResult] | None = None,
-            rate_info: dict | None = None,
-        ) -> DefenseDecision:
-            elapsed = (time.perf_counter_ns() - started) / 1e6
-            outcome = DefenseDecision(
-                decision=decision,
-                reason=reason,
-                source=features.source,
-                rule_results=tuple(results or ()),
-                detail=detail,
-                elapsed_ms=elapsed,
-                rule_version=version,
+        rate = self._rl.try_acquire(features.source)
+        rate_info = self._rate_info(rate)
+        if not rate.allowed:
+            return self._finish(
+                started,
+                version,
+                features,
+                Decision.RATE_LIMITED,
+                Reason.RATE_LIMIT_QUOTA_EXHAUSTED,
+                f"quota exhausted; retry_after_ms={rate.retry_after_ms}",
+                rate_info=rate_info,
             )
-            record = audit.build_audit_record(
-                source=features.source,
-                method=features.method,
-                path=features.path,
-                headers=features.headers,
-                query=features.query,
-                body_summary=features.body_summary,
-                decision=decision.value,
-                reason=reason.value,
-                detail=detail,
-                rule_version=version,
-                rule_results=[
-                    {
-                        "rule_id": r.rule_id,
-                        "verdict": r.verdict.value,
-                        "priority": r.priority,
-                        "effect": r.effect.value,
-                        "error_type": r.error_type,
-                        "elapsed_ms": round(r.elapsed_ms, 3),
-                    }
-                    for r in (results or ())
-                ],
-                rate_limit=rate_info,
-                elapsed_ms=elapsed,
-            )
-            audit.log_decision(record)
-            return outcome
+        return self._decide_rules(
+            started, version, rules, features, rate_info, content_check_enabled
+        )
 
-        # 1) 限流
-        rl = self._rl.try_acquire(features.source)
-        rate_info = {
+    @staticmethod
+    def _rate_info(rl) -> dict:
+        return {
             "allowed": rl.allowed,
             "remaining": rl.remaining,
             "limit": rl.limit,
             "window_ms": rl.window_ms,
             "retry_after_ms": rl.retry_after_ms,
         }
+
+    def reserve_quota(
+        self,
+        features: RequestFeatures,
+        *,
+        policy_version: int = 0,
+        started_ns: int | None = None,
+    ) -> DefenseDecision | None:
+        """正文接收前的来源限流判定。
+
+        成功返回 None（配额已扣减）；被限流返回 RATE_LIMITED 结论，调用方
+        必须立即拒绝且**不得**再调用规则判定/接收正文。
+        """
+        started = time.perf_counter_ns() if started_ns is None else started_ns
+        version, _rules = self._store.snapshot()
+        rl = self._rl.try_acquire(features.source)
         if not rl.allowed:
-            return finish(
+            features = _with_policy_version(features, policy_version)
+            return self._finish(
+                started,
+                version,
+                features,
                 Decision.RATE_LIMITED,
                 Reason.RATE_LIMIT_QUOTA_EXHAUSTED,
                 f"quota exhausted; retry_after_ms={rl.retry_after_ms}",
-                rate_info=rate_info,
+                rate_info=self._rate_info(rl),
+            )
+        return None
+
+    def reject_ingress(
+        self,
+        features: RequestFeatures,
+        reason: Reason,
+        detail: str,
+        *,
+        rate_info: dict | None = None,
+        started_ns: int | None = None,
+    ) -> DefenseDecision:
+        """正文接收阶段的早拒绝（太大/检查不完整/超时/容量饱和/断开）。
+
+        与限流、规则拒绝走完全一致的审计口径；此时不进行规则求值。
+        """
+        started = time.perf_counter_ns() if started_ns is None else started_ns
+        version, _rules = self._store.snapshot()
+        return self._finish(
+            started,
+            version,
+            features,
+            Decision.DENY,
+            reason,
+            detail,
+            rate_info=rate_info,
+        )
+
+    def decide_rules(
+        self,
+        features: RequestFeatures,
+        *,
+        rate_info: dict,
+        content_check_enabled: bool = True,
+        started_ns: int | None = None,
+    ) -> DefenseDecision:
+        """正文接收后的规则组合判定（配额已由 reserve_quota 扣减）。"""
+        started = time.perf_counter_ns() if started_ns is None else started_ns
+        version, rules = self._store.snapshot()
+        return self._decide_rules(
+            started, version, rules, features, rate_info, content_check_enabled
+        )
+
+    # ------------------------------------------------------------------ #
+    # 内部：审计收口与规则求值
+    # ------------------------------------------------------------------ #
+    def _finish(
+        self,
+        started_ns: int,
+        version: int,
+        features: RequestFeatures,
+        decision: Decision,
+        reason: Reason,
+        detail: str,
+        results: list[RuleEvalResult] | None = None,
+        rate_info: dict | None = None,
+    ) -> DefenseDecision:
+        elapsed = (time.perf_counter_ns() - started_ns) / 1e6
+        outcome = DefenseDecision(
+            decision=decision,
+            reason=reason,
+            source=features.source,
+            rule_results=tuple(results or ()),
+            detail=detail,
+            elapsed_ms=elapsed,
+            rule_version=version,
+            content_policy_version=features.content_policy_version,
+        )
+        record = audit.build_audit_record(
+            source=features.source,
+            method=features.method,
+            path=features.path,
+            headers=features.headers,
+            query=features.query,
+            body_summary=features.body_summary,
+            decision=decision.value,
+            reason=reason.value,
+            detail=detail,
+            rule_version=version,
+            rule_results=[
+                {
+                    "rule_id": r.rule_id,
+                    "verdict": r.verdict.value,
+                    "priority": r.priority,
+                    "effect": r.effect.value,
+                    "error_type": r.error_type,
+                    "elapsed_ms": round(r.elapsed_ms, 3),
+                }
+                for r in (results or ())
+            ],
+            rate_limit=rate_info,
+            elapsed_ms=elapsed,
+            body_length=features.body_length,
+            body_fully_inspected=features.body_fully_inspected,
+            content_policy_version=features.content_policy_version,
+        )
+        audit.log_decision(record)
+        return outcome
+
+    def _decide_rules(
+        self,
+        started: int,
+        version: int,
+        rules: tuple,
+        features: RequestFeatures,
+        rate_info: dict,
+        content_check_enabled: bool,
+    ) -> DefenseDecision:
+        # 内容判定关闭时，body 类规则不参与求值（其余字段规则照常），
+        # 避免在未检查正文上做出基于内容的错误判定。
+        effective_rules = rules
+        if not content_check_enabled:
+            effective_rules = tuple(
+                r for r in rules if r.config.field_name != "body"
             )
 
         # 2) 规则数量上限（纵深防御；store 在写入侧已拒绝超量规则集）
         if len(rules) > self._max_rules:
-            return finish(
+            return self._finish(
+                started,
+                version,
+                features,
                 Decision.DENY,
                 Reason.RULE_LIMIT_EXCEEDED,
                 f"rule count {len(rules)} exceeds max {self._max_rules}",
@@ -229,7 +349,7 @@ class DefenseEngine:
         deadline = started + self._timeout_ns
         results: list[RuleEvalResult] = []
         engine_fault = ""
-        for rule in rules:
+        for rule in effective_rules:
             try:
                 results.append(self._eval_one(rule, features, deadline))
             except _EngineBusy as exc:
@@ -240,7 +360,10 @@ class DefenseEngine:
 
         # 5) 服务自身故障：独立分类，绝不与规则故障混淆
         if engine_fault:
-            return finish(
+            return self._finish(
+                started,
+                version,
+                features,
                 Decision.DENY,
                 Reason.ENGINE_INTERNAL_ERROR,
                 f"rule evaluation infrastructure failure: {engine_fault}",
@@ -256,7 +379,10 @@ class DefenseEngine:
 
         # 4a) 冲突从严且确定：allow 与 deny 同时命中
         if denies and allows:
-            return finish(
+            return self._finish(
+                started,
+                version,
+                features,
                 Decision.DENY,
                 Reason.RULE_CONFLICT_DENY,
                 "conflicting allow/deny rules matched; deny wins: "
@@ -266,7 +392,10 @@ class DefenseEngine:
             )
         # 4b) 明确拒绝
         if denies:
-            return finish(
+            return self._finish(
+                started,
+                version,
+                features,
                 Decision.DENY,
                 Reason.RULE_MATCH_DENY,
                 "matched deny rules: " + ",".join(r.rule_id for r in denies),
@@ -287,13 +416,28 @@ class DefenseEngine:
                     f"{r.rule_id}:{r.error_type}" for r in other_errors
                 )
             decision = Decision.ALLOW if self._fail_open else Decision.DENY
-            return finish(decision, reason, detail, results=results, rate_info=rate_info)
+            return self._finish(
+                started, version, features, decision, reason, detail,
+                results=results, rate_info=rate_info,
+            )
 
         # 4d) 无命中 => 放行（正常流量不被误拒）
-        return finish(
+        return self._finish(
+            started,
+            version,
+            features,
             Decision.ALLOW,
             Reason.OK,
             f"no rule matched ({len(results)} evaluated) in {elapsed_total:.2f}ms",
             results=results,
             rate_info=rate_info,
         )
+
+
+def _with_policy_version(
+    features: RequestFeatures, policy_version: int
+) -> RequestFeatures:
+    """返回带内容策略版本的特征副本（frozen dataclass 不可原地修改）。"""
+    if features.content_policy_version == policy_version:
+        return features
+    return dataclasses.replace(features, content_policy_version=policy_version)

@@ -57,6 +57,9 @@ def build_audit_record(
     rule_results: list[dict[str, Any]],
     rate_limit: dict[str, Any] | None,
     elapsed_ms: float,
+    body_length: int = 0,
+    body_fully_inspected: bool = True,
+    content_policy_version: int = 0,
 ) -> dict[str, Any]:
     """构造审计记录（dict）。输入摘要足以复现判定，敏感信息已脱敏。"""
     body = body_summary
@@ -74,9 +77,12 @@ def build_audit_record(
             "query": dict(query),
             "headers": redact_headers(headers),
             "body_summary": body,
+            "body_length": body_length,
+            "body_fully_inspected": body_fully_inspected,
         },
         "basis": {
             "rule_version": rule_version,
+            "content_policy_version": content_policy_version,
             "rule_results": rule_results,
             "rate_limit": rate_limit,
         },
