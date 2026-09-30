@@ -17,7 +17,7 @@ request_defense/
   rule.py          # 单条特征规则：编译（正则校验）与无状态求值
   store.py         # 规则集不可变快照 + 整体校验 + 原子替换（版本单调递增）
   policy.py        # 正文容量/内容策略（BodyPolicy）：不可变快照 + 整体校验 + 原子替换
-  bodyguard.py     # 有界正文预取（检查前缀）+ ASGI receive 原样重放 + 接收上限/超时
+  bodyguard.py     # 完整有界接收（内存+磁盘假脱机）+ ASGI receive 按原分片重放 + 接收上限/超时
   engine.py        # 限流预检 + 规则组合判定 + 超时/异常隔离 + 资源上限
   auth.py          # 管理接口 Bearer 令牌校验（常量时间比较、fail-closed）
   audit.py         # 结构化审计日志（敏感头脱敏、正文计量 body_meta）
@@ -101,15 +101,34 @@ curl -X PUT http://127.0.0.1:8000/admin/rules \
 
 ## 三、带正文入口（POST / PUT / PATCH）与有界容量
 
-带正文入口与 GET 等读入口走**完全相同**的防护链：先做来源额度预检（被限流直接 429，不读取正文、不执行业务），再做有界正文接收与内容判定，最后才进入业务。
+带正文入口与 GET 等读入口走**完全相同**的防护链：先做来源额度预检（被限流直接 429，不读取正文、不执行业务），再做**与送达方式无关**的有界正文接收与内容判定，最后才进入业务。
+
+### 3.0 判定与“正文怎么送达”完全无关（整包 / 分片 / 流式）
+
+防护层**先把正文完整、有界地接收下来，再下结论**（读到 ASGI `http.request` 的 `more_body=False` 才分类）。因此同一份正文，无论客户端：
+
+- 一次性发完整包（`bytes` + `Content-Length`）；
+- 分多片推送、带长度声明（多次 `http.request`，`Content-Length` 已知）；
+- **不带长度**一段段推（`Transfer-Encoding: chunked`，无 `Content-Length`）；
+- 第一片就是整段、或每片仅 1 字节；
+
+最终结论严格一致：
+
+| 正文总长度 | 结论（任何送达方式都相同） |
+| --- | --- |
+| `< inspect_limit`、`== inspect_limit` | 放行（边界不误伤） |
+| `inspect_limit < 长度 <= receive_limit` | **403 `content_inspection_incomplete`**（无法完成内容判定） |
+| `> receive_limit` | **413 `body_too_large`**（不接受） |
+
+> 历史实现只预取检查前缀、用 `more_body` 标志“再探测一个事件”来猜测后面还有没有数据。但不同 ASGI 服务器对同一份正文给出的分片/标志组合不同（例如整包可能是 `100B+more=True` 后接空收尾，也可能直接 `100B+more=False`），导致分片/流式发送时超检查上限的正文被误判成“恰好读满、没问题”而**静默放行**。新实现读完整个正文再分类，从根上消除了这一类差异。
 
 ### 3.1 放行即透传：业务侧拿到原始正文
 
 防护层在**纯 ASGI 层包装 `receive`**（不使用会缓冲整个请求体的 BaseHTTPMiddleware）：
 
-- 预取的 `http.request` 事件被**原样重放**给下游；跨过检查上限边界的单个 ASGI 分片被拆成两段重放，字节序、长度、内容类型与客户端发出的**完全一致**；
+- 正文先写入一个有界缓冲（小正文驻留内存，超过检查上限的部分**自动假脱机到临时文件**，见 3.3），放行时按**接收时的原始 ASGI 分片边界**逐段重放给下游，字节序、长度、内容类型与客户端发出的**完全一致**（包括跨边界分片，不再拆分/合并改写）；
 - 因此业务侧 `await request.body() / request.json() / request.form()` 不需要任何改动（**调用方协议不变**），不会出现“防护层提前消费导致业务读到空体/残体”；
-- 被限流（429）、被规则拒绝（403）、超接收上限（413）等情况下业务入口**绝不会被执行**（测试用副作用端点 `POST /api/side-effect` 断言）。
+- 被限流（429）、被规则拒绝（403）、超检查上限（403）、超接收上限（413）等情况下业务入口**绝不会被执行**（测试用副作用端点 `POST /api/side-effect` 断言）——即使是无 `Content-Length` 的分块流，413 也在**接收阶段、进入业务之前**给出，超量字节不会透传给业务。
 
 示例业务入口（可直接作为接入参考）：
 
@@ -126,31 +145,34 @@ curl -X PUT http://127.0.0.1:8000/admin/rules \
 - 写入口继续使用标准 `Content-Type` 与正文编码（JSON / `x-www-form-urlencoded` / `multipart/form-data` / 任意二进制），业务侧仍用 FastAPI 原生的 `request.body()/json()/form()` 读取；
 - 唯一新增的**默认行为差异**：POST/PUT/PATCH 现在会受到接收上限（默认 1 MiB）与检查上限（默认 64 KiB）保护——超过检查上限默认 403。历史上需要更大正文检查范围的入口，应通过 `PUT /admin/policy` 调大 `inspect_limit`（或在确认安全后关闭 `content_check_enabled`），并按需调大 `receive_limit`；这是有界防护的显式取舍，不需要改客户端协议。
 
-### 3.2 两个上限：语义严格区分
+### 3.2 两个上限：语义严格区分，且都在进业务之前判定
 
 | 策略字段 | 含义 | 触发结果 |
 | --- | --- | --- |
-| `inspect_limit`（检查上限，默认 64 KiB） | 内容规则的匹配范围。防护侧只缓冲至多这么多字节做内容判定 | 正文超过它但未超接收上限 => **403 `content_inspection_incomplete`**：“太大，无法完成内容判定”（默认 fail-closed，不猜测未检查部分） |
+| `inspect_limit`（检查上限，默认 64 KiB） | 内容规则的匹配范围。只有正文完整长度不超过它时，才对**整份正文**完成内容判定 | 正文超过它但未超接收上限 => **403 `content_inspection_incomplete`**：“太大，无法完成内容判定”（默认 fail-closed，不猜测未检查部分） |
 | `receive_limit`（接收上限，默认 1 MiB） | 服务愿意接收的正文总大小 | 超过它 => **413 `body_too_large`**：“太大，不接受”，业务不执行 |
 
-两类“太大”在 **HTTP 状态码（403 vs 413）与原因码**两个维度都可区分，审计记录中的 `body_meta` 还会给出 `content_length / content_type / inspected_bytes / exceeds_inspect_limit / inspect_limit / receive_limit`。
+- **检查范围之外的内容不会被当成“检查过了、没问题”**：只要总长度 `> inspect_limit`，就一定给出 403，写在第 65 字节之后的正文规则不可能因为分片/流式发送而被绕过；
+- **两类“太大”始终可区分**：HTTP 状态码（403 vs 413）与原因码两个维度都不同；审计记录的 `body_meta` 给出 `content_length / content_type / inspected_bytes / total_bytes / exceeds_inspect_limit / inspect_limit / receive_limit`；
+- **接收上限对任何送达方式生效**：声明的 `Content-Length > receive_limit` 时**一个字节都不读**直接 413；无 `Content-Length` 的分块流在接收过程中按**最新**接收上限累计计量，越界立即 413（不再依赖业务侧透传读取才发现）；
+- 当一份正文同时满足“超检查上限”与“超接收上限”时，结论取更严的 **413**（先检查接收上限）。
 
-边界语义（自动测试覆盖）：正文长度 `< inspect_limit` 与 `== inspect_limit` 正常进入内容判定；`> inspect_limit` 且内容判定开关开启时给出 `content_inspection_incomplete`；声明的 `Content-Length > receive_limit` 时**一个字节都不读取**直接 413；没有 `Content-Length` 的分块请求在下游透传阶段继续计量，越界即 413。
+边界语义（自动测试覆盖）：正文长度 `< inspect_limit` 与 `== inspect_limit` 正常进入内容判定（边界不误伤）；`> inspect_limit` 且内容判定开关开启时给出 `content_inspection_incomplete`；`== receive_limit` 仍可接收，`> receive_limit` 才 413。以上结论对整包、分多片、无长度流式**逐一参数化断言一致**。
 
 ### 3.3 有界性：内存、耗时、并发都有上限
 
-- **内存有界**：防护侧对单请求只保留检查前缀（≤ `inspect_limit`，跨边界分片另留至多一个 ASGI 分片的余量），不会因为正文很大而把整个对象堆进内存；
-- **耗时有界**：预取每次 `receive` 受 `REQUEST_DEFENSE_BODY_TIMEOUT_MS`（默认 5000ms）约束，慢发送不能挂死连接，超时返回 **408 `body_receive_timeout`**；
-- **并发有界**：在途带正文请求受 `REQUEST_DEFENSE_BODY_INFLIGHT`（默认 32）名额限制，名额耗尽立即 **503 `body_concurrency_limited`** 背压，不排队堆积；最坏总缓冲 ≈ `inflight × inspect_limit`；
-- **不绕过来源额度**：无论正文多大，限流预检都最先执行，且与读入口共用同一窗口与配额。
+- **内存有界（与正文总大小解耦）**：正文写入 `tempfile.SpooledTemporaryFile`，驻留内存阈值取本次请求入口时的 `inspect_limit`——放行的小正文全程留内存（快路径），超过检查上限的部分自动假脱机到操作系统临时文件。单请求防护侧驻留内存 ≤ `inspect_limit`，最坏总驻留 ≈ `inflight × inspect_limit`，不会因为客户端推一个超大正文就把它整体堆进内存；请求结束（放行重放完成或拒绝）立即关闭并删除临时文件；
+- **耗时有界**：每次 `receive` 受 `REQUEST_DEFENSE_BODY_TIMEOUT_MS`（默认 5000ms）约束，慢分片发送不能挂死连接，超时返回 **408 `body_receive_timeout`**；
+- **并发有界**：在途带正文请求受 `REQUEST_DEFENSE_BODY_INFLIGHT`（默认 32）名额限制，名额耗尽立即 **503 `body_concurrency_limited`** 背压，不排队堆积；
+- **不绕过来源额度**：无论正文多大、怎么分片，限流预检都最先执行，且与读入口共用同一窗口与配额（并发分块大正文的测试断言同来源仍精确限额）。
 
 ### 3.4 运行时容量与内容策略变更（不重启）
 
 - `GET /admin/policy`：查看当前 `version / inspect_limit / receive_limit / content_check_enabled`；
 - `PUT /admin/policy`：整体校验后在同一把锁内**原子替换**不可变快照，版本号 `+1`；
 - 非法配置（非正整数、`inspect_limit > receive_limit`、超过硬天花板 1 MiB/16 MiB、布尔非法）一律 **422 `invalid_policy`**（带 `field` 与 `current_version`），**旧策略继续生效，不会半更新**；
-- 请求在进入防护时取一次 `(rule_version, policy_version)` 快照，**整次处理要么完整用旧配置、要么完整用新配置**；响应体与审计记录同时带这两个版本；
-- `content_check_enabled=false` 时 `field_name == "body"` 的规则整体不参与判定（来源/路径/头/查询规则照常），便于在确认入口安全后临时对大正文放开内容判定；接收上限始终生效。
+- **对正在处理的分段/流式请求也完整按新策略生效**：正文接收期间每收到一个 ASGI 分片就重新取一次最新策略快照，接收上限与检查上限都按**当前最新值**计量和分类——请求处理途中调小 `receive_limit`，后续尚未到达的分片立即按新上限判 413；调大/调小 `inspect_limit`，最终的“完整长度 vs 检查上限”结论按新上限给出，不会出现“前半段按旧策略、后半段按新策略”。响应与审计中的 `policy_version` 即最终分类实际使用的版本；
+- `content_check_enabled=false` 时 `field_name == "body"` 的规则整体不参与判定（来源/路径/头/查询规则照常），便于在确认入口安全后临时对大正文放开内容判定；**接收上限始终生效**（即使关闭内容判定，超 `receive_limit` 的分块流仍在进业务之前被 413 拒绝）。
 
 ```bash
 curl -X PUT http://127.0.0.1:8000/admin/policy \
@@ -196,12 +218,31 @@ curl -X PUT http://127.0.0.1:8000/admin/policy \
 ## 七、验证方法
 
 ```bash
-uv run pytest -v          # 全量 110 个用例，单测日志会打印每个用例的输入与判定依据
+uv run pytest -v          # 全量 147 个用例，单测日志会打印每个用例的输入与判定依据
+# 只跑分段/流式一致性
+uv run pytest tests/test_body_streaming.py tests/test_bodyguard.py -v
 ```
 
 重点场景：
 
-- **带正文入口**：`tests/test_body.py`
+- **分段/流式一致性**：`tests/test_body_streaming.py`
+  - `TestStreamingVerdictConsistency::test_same_body_same_verdict_regardless_of_delivery`：
+    同一份正文（0/1/63/64/65/100/256/257/300/400 字节）× 10 种送达方式
+    （整包、1/7/32/64 字节分片带或不带 `Content-Length`、第一片整段），
+    断言结论完全一致：≤64 放行、65~256 一律 403、>256 一律 413；
+  - `test_allowed_streamed_body_arrives_byte_exact`：分片/流式放行时业务收到的字节与发送逐字节一致；
+  - `test_rejected_streamed_body_never_reaches_business`：403/413 时副作用端点计数为 0；
+  - `test_chunked_receive_limit_classifies_413_not_403` / `..._declared_...`：
+    无长度/带长度分块超**接收**上限必须是 413，不能被误判成 403；
+  - `TestRulesBehindInspectBoundary`：命中点写在检查范围之后的正文规则，
+    分片发送时也不能静默放行（fail-closed 403）；
+  - `TestStreamingMultiSegment`：多种分片大小拼接的多段正文逐字节一致；
+  - `TestStreamingConcurrentLargeBodies`：并发分块大正文结论有界（200/503/403/413，无 5xx、
+    不出现“分片就 200 放行”），且同来源并发不绕过滑动窗口配额；
+  - `TestStreamingSlowSender`：慢分片推送命中 408 且业务不执行；
+  - `TestRuntimePolicyDuringSegmentedRequest`：**在途**分段请求处理途中调小接收上限
+    （后续片 413）、调大/调小检查上限（结论按新策略完整生效），业务不被半旧半新绕过；
+- **带正文入口（整包/带长度，既有用例零回归）**：`tests/test_body.py`
   - `TestPassthroughIntegrity`：JSON / urlencoded / multipart / 二进制四类正文，
     断言放行时业务侧收到的字节、长度、内容类型与发送**完全一致**（含 0/1/63/64 字节边界、PUT/PATCH）；
   - `TestBlockedNeverReachesBusiness`：限流 429 与 body 规则 403 时副作用端点
@@ -212,8 +253,11 @@ uv run pytest -v          # 全量 110 个用例，单测日志会打印每个�
     并发大正文只出现 200/503、无 5xx；
   - `TestRuntimePolicyChanges`：策略运行时生效、非法配置 422 整体拒绝且旧策略保留、
     关闭/重开内容判定、并发更新版本集合完整无重复、管理鉴权；
-- **有界接收原语**：`tests/test_bodyguard.py`（直接测预取/重放：跨边界分片字节序、
-  无 Content-Length 分块重放、声明超限零读取、超时、透传阶段接收上限、PolicyStore 原子性）；
+- **有界接收原语**：`tests/test_bodyguard.py`（不经过 HTTP 直接测接收/重放：
+  判定与分片方式无关、跨边界分片字节序、无 Content-Length 分块重放、声明超限零读取、
+  **分块超限在接收阶段直接 BodyTooLarge**、恰好等于上限不误伤、超时、
+  **在途策略切换按最新上限计量**、超阈值正文假脱机临时文件后仍逐字节重放、
+  `http.disconnect` 原样只重放一次、PolicyStore 原子性）；
 - **并发冲击**：`tests/test_ratelimiter.py::test_concurrent_burst_no_overcount_no_overgrant`
   （50 线程 × 4 请求，断言恰好 100 放行 / 100 拒绝）、
   `tests/test_engine.py::TestConcurrentCountingAndRuleChanges`
@@ -248,4 +292,36 @@ head -c 300 /dev/zero    | curl -s -o /dev/null -w "%{http_code}\n" -X POST loca
 curl -s -X PUT localhost:8000/admin/policy -H 'Authorization: Bearer change-me' \
   -H 'Content-Type: application/json' \
   -d '{"inspect_limit":128,"receive_limit":1024,"content_check_enabled":true}'
+```
+
+**手动复现分段/流式（无 `Content-Length`，每片之间停顿）**——结论必须与整包一致：
+
+```bash
+# 100 字节，分 10 片、Transfer-Encoding: chunked、每片间隔 0.2s
+# 旧实现这里会错误地 200 放行；修复后与整包一致 => 403 content_inspection_incomplete
+( for i in $(seq 1 10); do
+    printf 'a\n0a\r\n'; head -c 10 /dev/zero | tr '\0' 'y'; printf '\r\n'
+    sleep 0.2
+  done
+  printf '0\r\n\r\n'
+) | curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+    localhost:8000/api/upload/raw -H "Transfer-Encoding: chunked" --data-binary @-
+
+# 更直观的方式：用 Python 迭代器分多次推送（自动化测试即采用这种方式）
+uv run python - <<'PY'
+import asyncio, httpx
+from request_defense.app import create_app
+from request_defense.config import DefenseConfig
+app = create_app(DefenseConfig(body_inspect_limit=64, body_receive_limit=256, rate_limit=1000))
+async def main():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as ac:
+        async def chunks(data, n):
+            for i in range(0, len(data), n):
+                await asyncio.sleep(0.05); yield data[i:i+n]
+        for label, data, n in [("inspect", b"y"*100, 3), ("receive", b"z"*400, 100)]:
+            r = await ac.post("http://t/api/upload/raw", content=chunks(data, n),
+                              headers={"X-Forwarded-For": "10.0.0.1"})
+            print(label, r.status_code, r.json()["error"])   # inspect 403 / receive 413
+asyncio.run(main())
+PY
 ```

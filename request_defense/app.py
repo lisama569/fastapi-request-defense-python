@@ -3,21 +3,25 @@
 统一保护口径（GET 读入口与 POST/PUT/PATCH 写入口完全一致）：
 - 所有非豁免入口先过**来源额度预检**（限流 429，被拒不接收正文、不执行业务），
   再过特征规则与审计；带正文请求的正文计量/内容结论使用同一套 Reason 与审计结构；
-- 放行时业务侧拿到的是客户端原始正文：ASGI receive 事件被原样重放（跨检查边界
-  的分片拆两段重放），防护层不提前消费、不截断、不改写长度与内容类型。
+- 放行时业务侧拿到的是客户端原始正文：正文被完整接收到有界缓冲（小正文驻留
+  内存、超出检查上限的部分假脱机临时文件），放行时按原 ASGI 分片边界重放，
+  防护层不提前消费、不截断、不改写长度与内容类型。
 
-有界的内容检查与接收（policy.BodyPolicy）：
-- inspect_limit：内容规则匹配范围上限，只缓冲这么多字节做判定，内存有界；
-  正文超过该上限但未超接收上限 => content_inspection_incomplete（默认 403，
-  “太大无法完成内容判定”，与下面的“不接受”严格区分）；
+有界的内容检查与接收（policy.BodyPolicy）——**结论与送达方式无关**：
+- 防护层先把正文完整接收再分类，整包 / 分多片 / 无 Content-Length 流式得到
+  的结论严格一致；
+- inspect_limit：内容规则匹配范围上限；正文总长度超过它 =>
+  content_inspection_incomplete（默认 403，“太大无法完成内容判定”，
+  fail-closed；检查范围之后的内容不会被当成“已检查、没问题”而绕过）；
 - receive_limit：接收上限，超过 => body_too_large（413，“太大不接受”），
-  业务入口不会被执行；无 Content-Length 的分块请求在重放透传时继续计量；
-- 在途名额信号量限制并发大正文的缓冲总量；receive 超时 => body_receive_timeout。
+  在接收阶段、进入业务之前判定（含无 Content-Length 的分块流），不向业务透传；
+- 在途名额信号量限制并发大正文的驻留总量；receive 超时 => body_receive_timeout。
 
 运行时策略变更（不重启）：
 - GET/PUT /admin/policy：整体校验 + 原子替换 + 版本单调，与规则集同一语义；
-- 请求在进入防护时取一次 (rule_version, policy_version) 快照，整次处理
-  要么完整用旧配置，要么完整用新配置，不存在半更新/半旧半新。
+- 接收途中每收到一个分片即刷新策略快照，运行时调整两档上限对**在途的分段
+  请求**也完整生效，不会一半旧一半新；响应/审计中的 policy_version 即最终
+  分类实际使用的版本。
 """
 
 from __future__ import annotations
@@ -29,7 +33,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import bodyguard
 from .auth import AuthError, authenticate, mask_token
 from .bodyguard import (
     BODY_METHODS,
@@ -295,18 +298,25 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
 
         try:
             try:
+                # 完整、有界地接收正文后再下结论：结论与送达方式（整包/分片/
+                # 有无 Content-Length）无关；接收途中每次分片都刷新策略快照，
+                # 运行时调整的上限对在途的分段请求完整生效。
                 prefetch = await prefetch_body(
                     scope_headers=headers_raw,
                     receive=receive,
                     policy=policy,
                     receive_timeout_ms=config.body_receive_timeout_ms,
+                    policy_provider=policy_store.snapshot,
+                    # 单请求驻留内存 ≤ 检查上限：放行的小正文留内存（快路径），
+                    # 超过检查上限的部分假脱机临时文件，最坏驻留 ≈ inflight×inspect。
+                    spool_threshold=policy.inspect_limit,
                 )
             except BodyTooLarge as exc:
                 outcome = engine.deny_body_stage(
                     features_from(""),
                     Reason.BODY_TOO_LARGE,
-                    f"declared/received body {exc.received} exceeds receive_limit {exc.limit}",
-                    policy_version=policy_version,
+                    f"declared/chunked body {exc.received} exceeds receive_limit {exc.limit}",
+                    policy_version=exc.policy_version or policy_version,
                     body_meta={"declared": exc.received, "receive_limit": exc.limit},
                 )
                 await deny(outcome)
@@ -321,49 +331,63 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
                 await deny(outcome)
                 return
 
+            # 整次正文接收使用的最终策略快照（在途策略变更后可能不同于入口版本）：
+            # prefetch 按每个分片后的最新策略计量与分类，返回的 policy_version
+            # 即分类时使用的版本。此处到规则判定之间没有 await，再取一次快照
+            # 必然与 prefetch 完成时一致；body_meta / 审计都以它为准，
+            # 杜绝一半旧一半新。
+            final_version = prefetch.policy_version
+            _, final_policy = policy_store.snapshot()
+
             summary = prefetch.inspected.decode("utf-8", "replace")
             body_meta = {
                 "content_length": prefetch.content_length,
                 "content_type": prefetch.content_type,
                 "inspected_bytes": len(prefetch.inspected),
                 "exceeds_inspect_limit": prefetch.exceeds_inspect,
-                "inspect_limit": policy.inspect_limit,
-                "receive_limit": policy.receive_limit,
+                "total_bytes": prefetch.total_seen,
+                "inspect_limit": final_policy.inspect_limit,
+                "receive_limit": final_policy.receive_limit,
             }
 
-            # 4) 超过检查上限：默认 fail-closed（不猜测未检查部分）
-            if policy.content_check_enabled and prefetch.exceeds_inspect:
-                outcome = engine.deny_body_stage(
-                    features_from(summary),
-                    Reason.CONTENT_INSPECTION_INCOMPLETE,
-                    f"body exceeds inspect_limit {policy.inspect_limit}; "
-                    "content verdict cannot be completed",
-                    policy_version=policy_version,
-                    body_meta=body_meta,
-                )
-                await deny(outcome)
+            # 4) 超过检查上限：默认 fail-closed（不猜测未检查部分）。
+            #    正文已完整接收，整包与分片在此结论完全一致。
+            if final_policy.content_check_enabled and prefetch.exceeds_inspect:
+                try:
+                    outcome = engine.deny_body_stage(
+                        features_from(summary),
+                        Reason.CONTENT_INSPECTION_INCOMPLETE,
+                        f"body exceeds inspect_limit {final_policy.inspect_limit}; "
+                        "content verdict cannot be completed",
+                        policy_version=final_version,
+                        body_meta=body_meta,
+                    )
+                    await deny(outcome)
+                finally:
+                    prefetch.close()
                 return
 
             # 5) 内容判定（开关关闭时 body 规则整体不参与）+ 其余特征规则
-            outcome = engine.evaluate_rules(
-                features_from(summary),
-                policy_version=policy_version,
-                body_meta=body_meta,
-                body_rule_scoped=not policy.content_check_enabled,
-            )
-            if outcome.decision is not Decision.ALLOW:
-                await deny(outcome)
-                return
+            try:
+                outcome = engine.evaluate_rules(
+                    features_from(summary),
+                    policy_version=final_version,
+                    body_meta=body_meta,
+                    body_rule_scoped=not final_policy.content_check_enabled,
+                )
+                if outcome.decision is not Decision.ALLOW:
+                    await deny(outcome)
+                    return
 
-            # 6) 放行：原样重放预取事件，随后透传 receive；业务读到完整原始正文。
-            #    下游拉到预取窗口之外的数据后即可释放在途名额（继续透传只计量不缓冲）。
-            replay = make_replay_receive(
-                receive, prefetch.events, policy, on_drained=release_slot
-            )
-            await app_default(scope, replay, send)
+                # 6) 放行：从假脱机按原 ASGI 事件边界重放完整正文，
+                #    业务读到与客户端发送逐字节一致的原始正文（长度/类型不变）。
+                replay = make_replay_receive(
+                    receive, prefetch.spool, prefetch.terminal_event
+                )
+                await app_default(scope, replay, send)
+            finally:
+                prefetch.close()
         except Exception:  # noqa: BLE001 - 预取/判定/下游阶段的意外统一 500
-            # 注：下游读取触发 BodyTooLarge 时由注册的 exception_handler 转 413，
-            # 不会走到这里；走到这里说明响应尚未开始或防护自身故障。
             logger.exception("defense body-stage failure")
             await _send_json(send, 500, _error_body(
                 Reason.ENGINE_INTERNAL_ERROR.value, "internal defense failure"))
@@ -550,7 +574,9 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
             "content_check_enabled": new_policy.content_check_enabled,
         }
 
-    # 业务侧在下游读取超大（无 Content-Length）正文时的兜底 413。
+    # BodyTooLarge 的纵深防御兜底：正常路径下接收上限在 prefetch 阶段即被
+    # 拦截（见 defense_asgi_app），业务不会再触发它；此处仅在有代码绕过
+    # prefetch 直接向下游 receive 抛 BodyTooLarge 时统一转成 413。
     # 必须在 build_middleware_stack 前注册（ExceptionMiddleware 构建时快照）。
     @app.exception_handler(BodyTooLarge)
     async def _body_too_large_handler(request: Request, exc: BodyTooLarge):
