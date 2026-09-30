@@ -139,37 +139,150 @@ def test_receive_timeout_propagates():
             policy=policy, receive_timeout_ms=50))
 
 
-def test_replay_enforces_receive_limit_for_chunked():
+def test_streaming_oversize_rejected_at_prefetch_without_business():
     policy = BodyPolicy.validated(64, 256)
-    # 分块：每块 100，共 400；无 Content-Length，预取不越界，重放计量拒绝
+    # 分块：每块 100，共 400；无 Content-Length。新语义下预取必须持续计量
+    # 并在越过 receive_limit 的当下直接拒绝——结论与整包/带长度完全一致，
+    # 不会把超量正文留给重放阶段、更不可能透传给业务。
     receive = _receiver([
         (b"a" * 100, True), (b"b" * 100, True),
         (b"c" * 100, True), (b"d" * 100, False),
     ])
+    with pytest.raises(BodyTooLarge) as exc:
+        asyncio.run(prefetch_body(
+            scope_headers=_hdrs(None), receive=receive, policy=policy,
+            receive_timeout_ms=1000))
+    assert exc.value.limit == 256
+    assert exc.value.received > 256
+
+
+def test_streaming_oversize_httpx_style_terminator_also_rejected():
+    # httpx/ASGI 风格：每个数据事件都 more_body=True，末尾再来一个独立的
+    # 空收尾事件。旧实现在“最后一片恰好填满接收上限 + 空收尾”时会漏判。
+    policy = BodyPolicy.validated(64, 256)
+    receive = _receiver([
+        (b"a" * 100, True), (b"b" * 100, True),
+        (b"c" * 100, True), (b"", False),
+    ])
+    with pytest.raises(BodyTooLarge):
+        asyncio.run(prefetch_body(
+            scope_headers=_hdrs(None), receive=receive, policy=policy,
+            receive_timeout_ms=1000))
+
+
+# --------------------- 送达方式无关的一致判定（回归） ---------------------- #
+@pytest.mark.parametrize("n", [65, 100, 256])
+def test_httpx_style_empty_terminator_is_not_treated_as_exact_limit(n):
+    """关键回归：每个数据事件 more_body=True，末尾再给独立空收尾事件。
+
+    旧实现的边界探测只看“探测事件”本身，当最后一片数据恰好填满
+    inspect_limit、下一个事件是空收尾时，会把 >inspect_limit 的正文误判成
+    “恰好等于上限”而放行。
+    """
+    policy = BodyPolicy.validated(64, 256)
+    receive = _receiver([
+        (b"y" * min(n, 50), True),
+        (b"y" * max(0, n - 50), True),
+        (b"", False),
+    ])
     pf = asyncio.run(prefetch_body(
         scope_headers=_hdrs(None), receive=receive, policy=policy,
         receive_timeout_ms=1000))
+    assert pf.total_bytes == n
     assert pf.exceeds_inspect is True
+    assert pf.ended is True
+    # 重放仍逐字节完整（供上层放行路径使用；此处虽为拒绝路径，事件保真）
+    receive2 = _receiver([
+        (b"y" * min(n, 50), True),
+        (b"y" * max(0, n - 50), True),
+        (b"", False),
+    ])
+    pf2 = asyncio.run(prefetch_body(
+        scope_headers=_hdrs(None), receive=receive2, policy=policy,
+        receive_timeout_ms=1000))
+    assert _collect_replay(pf2, receive2, policy) == b"y" * n
 
-    async def run():
-        replay = make_replay_receive(receive, pf.events, policy)
-        delivered = 0
-        raised = False
-        try:
-            while True:
-                msg = await replay()
-                delivered += len(msg.get("body", b""))
-                if not msg.get("more_body", False):
-                    break
-        except BodyTooLarge as exc:
-            raised = True
-            assert exc.limit == 256
-        return delivered, raised
 
-    delivered, raised = asyncio.run(run())
-    assert raised is True                       # 400 字节分块流被接收上限拒绝
-    assert delivered <= 256 + 100               # 拒绝点之后不再透传（误差≤一个分片）
-    assert delivered < 400                      # 完整正文绝不会全部交付给业务
+@pytest.mark.parametrize("n", [0, 1, 63, 64])
+def test_httpx_style_empty_terminator_exact_limit_still_allowed(n):
+    policy = BodyPolicy.validated(64, 256)
+    receive = _receiver([(b"z" * n, True), (b"", False)])
+    pf = asyncio.run(prefetch_body(
+        scope_headers=_hdrs(n), receive=receive, policy=policy,
+        receive_timeout_ms=1000))
+    assert pf.exceeds_inspect is False
+    assert pf.total_bytes == n
+    receive2 = _receiver([(b"z" * n, True), (b"", False)])
+    pf2 = asyncio.run(prefetch_body(
+        scope_headers=_hdrs(n), receive=receive2, policy=policy,
+        receive_timeout_ms=1000))
+    assert _collect_replay(pf2, receive2, policy) == b"z" * n
+
+
+def test_policy_provider_lowers_inspect_limit_for_inflight_body():
+    # 在途期间通过 provider 调小 inspect_limit：尚未读到的部分立即按新上限
+    policy = BodyPolicy.validated(64, 256)
+    new_policy = BodyPolicy.validated(16, 256)
+    holder = {"v": 1, "p": policy}
+
+    def provider():
+        return holder["v"], holder["p"]
+
+    q = [{"type": "http.request", "body": b"a" * 30, "more_body": True}]
+    idx = {"i": 0}
+
+    async def receive():
+        i = idx["i"]
+        idx["i"] += 1
+        if i == 0:
+            return q[0]
+        if i == 1:
+            # 第一个事件被消费后，策略更新为 inspect_limit=16
+            holder["v"] = 2
+            holder["p"] = new_policy
+            return {"type": "http.request", "body": b"b" * 10,
+                    "more_body": False}
+        return {"type": "http.disconnect"}
+
+    pf = asyncio.run(prefetch_body(
+        scope_headers=_hdrs(40), receive=receive, policy=policy,
+        receive_timeout_ms=1000, policy_provider=provider))
+    assert pf.policy_version == 2
+    assert pf.policy.inspect_limit == 16
+    assert pf.total_bytes == 40
+    assert pf.exceeds_inspect is True       # 40 > 新 inspect_limit 16
+    # inspected 始终按“最终生效”的检查上限截取，供 body 规则/审计使用
+    assert len(pf.inspected) == 16
+    assert pf.inspected == b"a" * 16
+
+
+def test_policy_provider_lowers_receive_limit_rejects_inflight_body():
+    policy = BodyPolicy.validated(64, 256)
+    holder = {"v": 1, "p": policy}
+
+    def provider():
+        return holder["v"], holder["p"]
+
+    idx = {"i": 0}
+
+    async def receive():
+        i = idx["i"]
+        idx["i"] += 1
+        if i == 0:
+            return {"type": "http.request", "body": b"a" * 50,
+                    "more_body": True}
+        if i == 1:
+            holder["v"] = 2
+            holder["p"] = BodyPolicy.validated(64, 128)
+            return {"type": "http.request", "body": b"b" * 200,
+                    "more_body": False}  # 累计 250 > 新 receive_limit 128
+        return {"type": "http.disconnect"}
+
+    with pytest.raises(BodyTooLarge) as exc:
+        asyncio.run(prefetch_body(
+            scope_headers=_hdrs(250), receive=receive, policy=policy,
+            receive_timeout_ms=1000, policy_provider=provider))
+    assert exc.value.limit == 128
 
 
 # ------------------------------ PolicyStore ------------------------------- #

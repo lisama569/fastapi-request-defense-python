@@ -6,7 +6,7 @@
 2. **请求特征规则** —— 多条规则组合判定（命中/未命中/冲突）；
 3. **判定审计** —— 每次判定输出结论、原因、依据与输入摘要。
 
-所有入口（除豁免的运维路径与管理路径外）都经过同一套中间件，因此正常、被限流、可疑流量的处置口径完全一致；**带正文入口（POST/PUT/PATCH）与读入口共用同一套来源额度、特征规则与审计口径**，放行时业务侧拿到客户端原始正文（不消费、不截断、不改写）。
+所有入口（除豁免的运维路径与管理路径外）都经过同一套中间件，因此正常、被限流、可疑流量的处置口径完全一致；**带正文入口（POST/PUT/PATCH）与读入口共用同一套来源额度、特征规则与审计口径**。带正文入口的判定结论**只取决于正文的累计字节数，与正文的送达方式无关**——客户端一次性发整包（带 `Content-Length`）、分多片发送、还是不带长度一段段流式（分块）推送，同一份正文得到的结论完全相同；放行时业务侧拿到客户端原始正文（不消费、不截断、不改写）。
 
 ## 目录结构
 
@@ -17,7 +17,7 @@ request_defense/
   rule.py          # 单条特征规则：编译（正则校验）与无状态求值
   store.py         # 规则集不可变快照 + 整体校验 + 原子替换（版本单调递增）
   policy.py        # 正文容量/内容策略（BodyPolicy）：不可变快照 + 整体校验 + 原子替换
-  bodyguard.py     # 有界正文预取（检查前缀）+ ASGI receive 原样重放 + 接收上限/超时
+  bodyguard.py     # 有界正文接收（读到结束/越界再下结论）+ ASGI receive 原样重放 + 接收上限/超时
   engine.py        # 限流预检 + 规则组合判定 + 超时/异常隔离 + 资源上限
   auth.py          # 管理接口 Bearer 令牌校验（常量时间比较、fail-closed）
   audit.py         # 结构化审计日志（敏感头脱敏、正文计量 body_meta）
@@ -103,13 +103,20 @@ curl -X PUT http://127.0.0.1:8000/admin/rules \
 
 带正文入口与 GET 等读入口走**完全相同**的防护链：先做来源额度预检（被限流直接 429，不读取正文、不执行业务），再做有界正文接收与内容判定，最后才进入业务。
 
-### 3.1 放行即透传：业务侧拿到原始正文
+### 3.1 送达方式无关：整包 / 分片 / 流式结论一致，放行即透传原始正文
 
-防护层在**纯 ASGI 层包装 `receive`**（不使用会缓冲整个请求体的 BaseHTTPMiddleware）：
+防护层在**纯 ASGI 层包装 `receive`**（不使用会缓冲整个请求体的 BaseHTTPMiddleware）。为了让判定不依赖“正文恰好怎么被切成 ASGI 事件”，防护层不会只看前一两个事件就猜测结论，而是把 `http.request` 事件**持续读到“正文结束”（`more_body=False`）或“越过接收上限”为止**，只凭**累计字节数与结束事实**下结论：
 
-- 预取的 `http.request` 事件被**原样重放**给下游；跨过检查上限边界的单个 ASGI 分片被拆成两段重放，字节序、长度、内容类型与客户端发出的**完全一致**；
-- 因此业务侧 `await request.body() / request.json() / request.form()` 不需要任何改动（**调用方协议不变**），不会出现“防护层提前消费导致业务读到空体/残体”；
-- 被限流（429）、被规则拒绝（403）、超接收上限（413）等情况下业务入口**绝不会被执行**（测试用副作用端点 `POST /api/side-effect` 断言）。
+- 读到结束、总字节 ≤ `inspect_limit`：正文完整落在检查范围内，进入内容判定；
+- 读到结束、`inspect_limit` < 总字节 ≤ `receive_limit`：`content_inspection_incomplete`（403）；
+- 累计字节一旦 > `receive_limit`：立刻 `body_too_large`（413），该越界事件及后续字节**不保留、不透传，业务不执行**。
+
+因此像“最后一片数据恰好把检查上限填满、下一个事件只是独立的空收尾 `(b"", more_body=False)`”（httpx ASGI 测试通道与部分真实服务器对分块上传就是这种事件形态：**每个**数据事件都带 `more_body=True`，末尾再来一个空收尾事件）不会再被误判成“正文恰好等于上限”而放行；写在检查范围之后的规则特征，也不能靠“放在后面一片”绕过。
+
+放行路径上，预取期间读到的 ASGI 事件按**原始事件边界原样重放**给下游（不拆事件、不改写 `more_body`），随后透传真实 `receive`；字节序、长度、内容类型与客户端发出的**完全一致**：
+
+- 业务侧 `await request.body() / request.json() / request.form()` 不需要任何改动（**调用方协议不变**），不会出现“防护层提前消费导致业务读到空体/残体”；
+- 被限流（429）、被规则拒绝（403）、无法完成内容判定（403）、超接收上限（413）等情况下业务入口**绝不会被执行**（测试用副作用端点 `POST /api/side-effect` 断言）。
 
 示例业务入口（可直接作为接入参考）：
 
@@ -130,27 +137,32 @@ curl -X PUT http://127.0.0.1:8000/admin/rules \
 
 | 策略字段 | 含义 | 触发结果 |
 | --- | --- | --- |
-| `inspect_limit`（检查上限，默认 64 KiB） | 内容规则的匹配范围。防护侧只缓冲至多这么多字节做内容判定 | 正文超过它但未超接收上限 => **403 `content_inspection_incomplete`**：“太大，无法完成内容判定”（默认 fail-closed，不猜测未检查部分） |
-| `receive_limit`（接收上限，默认 1 MiB） | 服务愿意接收的正文总大小 | 超过它 => **413 `body_too_large`**：“太大，不接受”，业务不执行 |
+| `inspect_limit`（检查上限，默认 64 KiB） | 内容规则的匹配范围。body 规则只在这个前缀内匹配；防护层为下结论会读到正文结束，但只把该前缀交给规则/审计 | 正文超过它但未超接收上限 => **403 `content_inspection_incomplete`**：“太大，无法完成内容判定”（默认 fail-closed，不猜测未检查部分，**不分片/流式都一致**） |
+| `receive_limit`（接收上限，默认 1 MiB） | 服务愿意接收的正文总大小（判定在业务执行**之前**完成） | 超过它 => **413 `body_too_large`**：“太大，不接受”，越界字节不缓冲、不透传、业务不执行；**有无 `Content-Length`、是否分片结论一致** |
 
-两类“太大”在 **HTTP 状态码（403 vs 413）与原因码**两个维度都可区分，审计记录中的 `body_meta` 还会给出 `content_length / content_type / inspected_bytes / exceeds_inspect_limit / inspect_limit / receive_limit`。
+两类“太大”在 **HTTP 状态码（403 vs 413）与原因码**两个维度都可区分，审计记录中的 `body_meta` 还会给出 `content_length / content_type / inspected_bytes / total_bytes / exceeds_inspect_limit / inspect_limit / receive_limit`。
 
-边界语义（自动测试覆盖）：正文长度 `< inspect_limit` 与 `== inspect_limit` 正常进入内容判定；`> inspect_limit` 且内容判定开关开启时给出 `content_inspection_incomplete`；声明的 `Content-Length > receive_limit` 时**一个字节都不读取**直接 413；没有 `Content-Length` 的分块请求在下游透传阶段继续计量，越界即 413。
+边界语义（自动测试覆盖，整包与分片双通道各断言一遍）：
+
+- 正文长度 `< inspect_limit` 与 `== inspect_limit`：正常进入内容判定（边界不误伤，64 字节按 `[64]`、`[32,32]`、`[1]×64` 等多种切法都放行）；
+- `> inspect_limit` 且内容判定开关开启：一律 `content_inspection_incomplete`；即使触发规则的特征串写在第 64 字节之后，也不能靠分片摆放把它“藏到检查范围外”绕过；
+- 声明的 `Content-Length > receive_limit`：**一个字节都不读取**直接 413；
+- 没有 `Content-Length` 的分块/流式请求：预取持续计量，累计字节越过 `receive_limit` 的当下立即 413（不再像旧实现那样拖到下游重放阶段），`== receive_limit` 仍按检查上限口径处理、不误伤。
 
 ### 3.3 有界性：内存、耗时、并发都有上限
 
-- **内存有界**：防护侧对单请求只保留检查前缀（≤ `inspect_limit`，跨边界分片另留至多一个 ASGI 分片的余量），不会因为正文很大而把整个对象堆进内存；
+- **内存有界**：为了对“正文到底有多大、在哪里结束”给出与送达方式无关的确定结论，预取会读到正文结束或越过接收上限；读取在越界点立即停止，因此**单请求缓冲 ≤ `receive_limit`（硬天花板 16 MiB）**，最坏总缓冲 ≈ `inflight × receive_limit`，绝不会因为客户端持续推流而无界增长。放行重放只使用已保留的原始事件，不额外复制；
 - **耗时有界**：预取每次 `receive` 受 `REQUEST_DEFENSE_BODY_TIMEOUT_MS`（默认 5000ms）约束，慢发送不能挂死连接，超时返回 **408 `body_receive_timeout`**；
-- **并发有界**：在途带正文请求受 `REQUEST_DEFENSE_BODY_INFLIGHT`（默认 32）名额限制，名额耗尽立即 **503 `body_concurrency_limited`** 背压，不排队堆积；最坏总缓冲 ≈ `inflight × inspect_limit`；
-- **不绕过来源额度**：无论正文多大，限流预检都最先执行，且与读入口共用同一窗口与配额。
+- **并发有界**：在途带正文请求受 `REQUEST_DEFENSE_BODY_INFLIGHT`（默认 32）名额限制，名额耗尽立即 **503 `body_concurrency_limited`** 背压，不排队堆积；
+- **不绕过来源额度**：无论正文多大、怎么分片，限流预检都最先执行，且与读入口共用同一窗口与配额。
 
 ### 3.4 运行时容量与内容策略变更（不重启）
 
 - `GET /admin/policy`：查看当前 `version / inspect_limit / receive_limit / content_check_enabled`；
 - `PUT /admin/policy`：整体校验后在同一把锁内**原子替换**不可变快照，版本号 `+1`；
 - 非法配置（非正整数、`inspect_limit > receive_limit`、超过硬天花板 1 MiB/16 MiB、布尔非法）一律 **422 `invalid_policy`**（带 `field` 与 `current_version`），**旧策略继续生效，不会半更新**；
-- 请求在进入防护时取一次 `(rule_version, policy_version)` 快照，**整次处理要么完整用旧配置、要么完整用新配置**；响应体与审计记录同时带这两个版本；
-- `content_check_enabled=false` 时 `field_name == "body"` 的规则整体不参与判定（来源/路径/头/查询规则照常），便于在确认入口安全后临时对大正文放开内容判定；接收上限始终生效。
+- 规则快照在规则判定时取一次，整次规则求值对应同一个 `rule_version`；**正文策略在预取的每个 ASGI 事件后重新取快照**：整包请求读到的是进入时的策略，正在分段/流式送达的请求，其**尚未读到的部分立即按新上限判定**（调大、调小都适用），结论与审计记录中的 `policy_version` 即最终实际适用的版本，不会一半旧一半新；
+- `content_check_enabled=false` 时 `field_name == "body"` 的规则整体不参与判定（来源/路径/头/查询规则照常），便于在确认入口安全后临时对大正文放开内容判定；此时流式正文仍会完整重放给业务（逐字节一致），**接收上限始终生效**（越界仍 413）。
 
 ```bash
 curl -X PUT http://127.0.0.1:8000/admin/policy \
@@ -189,18 +201,30 @@ curl -X PUT http://127.0.0.1:8000/admin/policy \
 每次判定输出一条 JSON 结构化日志（放行 INFO，限流/拒绝 WARNING），包含：
 
 - `decision`（allow / rate_limited / deny）与可区分的 `reason`；
-- `input`：来源、方法、路径、查询参数、**脱敏后**的请求头、body 检查前缀（日志中截断到前 512 字节）与 `body_meta`（长度/内容类型/检查字节数/是否超过检查上限/两档上限）——足以复现判定，且不记录完整正文；
+- `input`：来源、方法、路径、查询参数、**脱敏后**的请求头、body 检查前缀（日志中截断到前 512 字节）与 `body_meta`（声明长度/内容类型/检查字节数/已读总字节数/是否超过检查上限/两档上限）——足以复现判定，且不记录完整正文；
 - `basis`：`rule_version`、每条规则的结论/优先级/动作/错误类型/耗时、限流剩余配额与 retry_after；
 - `elapsed_ms`：单请求总耗时。
 
 ## 七、验证方法
 
 ```bash
-uv run pytest -v          # 全量 110 个用例，单测日志会打印每个用例的输入与判定依据
+uv run pytest -v          # 全量用例（含分片/流式一致性、在途调参、并发冲击、异常规则）
 ```
 
 重点场景：
 
+- **分片/流式正文一致性（本次新增）**：`tests/test_streaming_body.py`
+  - 同一份 100 字节正文分别按 `[100] / [50,50] / [1,1,98] / [40,40,20] / [1]×100 / [64,36]`
+    等切法、以**不带 Content-Length 的异步流**（每数据事件 `more_body=True` + 末尾独立空
+    收尾事件，精确复现旧实现漏判形态）提交，全部稳定判 **403 `content_inspection_incomplete`**；
+  - 257/400 字节按多种切法流式提交，全部 **413 `body_too_large`**，业务计数不增加；
+  - 0/1/63/64 字节（含 64 字节按 `[64]/[32,32]/[1]×64` 切）与多段拼接放行，业务侧收到的
+    字节逐字节一致、内容类型不改写；
+  - 规则特征写在检查范围**之后**时，整包/分片/逐字节三种送法都 fail-closed，不能绕过；
+  - 20 来源并发流式大正文只出现 200/403/413、无 5xx，被拒请求业务不执行；
+  - 正文在途时调小 `inspect_limit` / `receive_limit`（403/413 各自验证）与调大
+    `receive_limit`，在途的分段请求完整按新策略走完，结论带新的 `policy_version`；
+  - 关闭内容判定后流式 200 字节完整透传、257 字节仍 413；慢流式晚到分片 => 408；
 - **带正文入口**：`tests/test_body.py`
   - `TestPassthroughIntegrity`：JSON / urlencoded / multipart / 二进制四类正文，
     断言放行时业务侧收到的字节、长度、内容类型与发送**完全一致**（含 0/1/63/64 字节边界、PUT/PATCH）；
@@ -212,8 +236,10 @@ uv run pytest -v          # 全量 110 个用例，单测日志会打印每个�
     并发大正文只出现 200/503、无 5xx；
   - `TestRuntimePolicyChanges`：策略运行时生效、非法配置 422 整体拒绝且旧策略保留、
     关闭/重开内容判定、并发更新版本集合完整无重复、管理鉴权；
-- **有界接收原语**：`tests/test_bodyguard.py`（直接测预取/重放：跨边界分片字节序、
-  无 Content-Length 分块重放、声明超限零读取、超时、透传阶段接收上限、PolicyStore 原子性）；
+- **有界接收原语**：`tests/test_bodyguard.py`（直接测读取/重放：
+  httpx 式“数据事件全 more_body=True + 独立空收尾”在 65/100/256 字节下稳定超限、
+  64/63 字节边界不误伤、声明超限零读取、超时、无长度流式越界在预取阶段直接 413、
+  `policy_provider` 在途调小检查/接收上限即时生效、PolicyStore 原子性）；
 - **并发冲击**：`tests/test_ratelimiter.py::test_concurrent_burst_no_overcount_no_overgrant`
   （50 线程 × 4 请求，断言恰好 100 放行 / 100 拒绝）、
   `tests/test_engine.py::TestConcurrentCountingAndRuleChanges`
@@ -248,4 +274,21 @@ head -c 300 /dev/zero    | curl -s -o /dev/null -w "%{http_code}\n" -X POST loca
 curl -s -X PUT localhost:8000/admin/policy -H 'Authorization: Bearer change-me' \
   -H 'Content-Type: application/json' \
   -d '{"inspect_limit":128,"receive_limit":1024,"content_check_enabled":true}'
+```
+
+用 curl 强制分块传输（`Expect:` 去掉 100-continue，`-T -` 走 chunked，无 Content-Length），
+验证同一份正文“整包 vs 流式”结论一致：
+
+```bash
+head -c 100 /dev/zero | curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  localhost:8000/api/upload/raw -H 'Content-Type: application/octet-stream' \
+  -H 'Expect:' -T -                            # 403（chunked，无长度）
+head -c 100 /dev/zero | curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  localhost:8000/api/upload/raw --data-binary @-   # 403（带 Content-Length，结论相同）
+head -c 300 /dev/zero | curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  localhost:8000/api/upload/raw -H 'Expect:' -T -   # 413（chunked 同样按接收上限拒）
+
+# 自动化复现（与真实分片服务器事件形态一致：数据事件全 more_body=True + 末尾空收尾）
+uv run pytest tests/test_streaming_body.py -v
+uv run pytest -v   # 全量回归
 ```

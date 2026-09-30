@@ -3,21 +3,27 @@
 统一保护口径（GET 读入口与 POST/PUT/PATCH 写入口完全一致）：
 - 所有非豁免入口先过**来源额度预检**（限流 429，被拒不接收正文、不执行业务），
   再过特征规则与审计；带正文请求的正文计量/内容结论使用同一套 Reason 与审计结构；
-- 放行时业务侧拿到的是客户端原始正文：ASGI receive 事件被原样重放（跨检查边界
-  的分片拆两段重放），防护层不提前消费、不截断、不改写长度与内容类型。
+- 放行时业务侧拿到的是客户端原始正文：预取读取的 ASGI 事件按原始事件边界
+  原样重放（不拆事件、不改写 more_body），随后透传真实 receive，防护层不
+  提前消费、不截断、不改写长度与内容类型。
 
-有界的内容检查与接收（policy.BodyPolicy）：
-- inspect_limit：内容规则匹配范围上限，只缓冲这么多字节做判定，内存有界；
-  正文超过该上限但未超接收上限 => content_inspection_incomplete（默认 403，
-  “太大无法完成内容判定”，与下面的“不接受”严格区分）；
-- receive_limit：接收上限，超过 => body_too_large（413，“太大不接受”），
-  业务入口不会被执行；无 Content-Length 的分块请求在重放透传时继续计量；
-- 在途名额信号量限制并发大正文的缓冲总量；receive 超时 => body_receive_timeout。
+判定与正文送达方式无关（整包带长度 / 分多片 / 无长度流式结论完全一致）：
+预取把正文读到“正文结束”或“越过接收上限”为止，只凭累计字节数下结论：
+- inspect_limit：内容规则匹配范围上限；正文超过它但未超 receive_limit =>
+  content_inspection_incomplete（默认 403，“太大无法完成内容判定”），写在
+  检查范围之后的特征不能靠分片摆放绕过；
+- receive_limit：接收上限，越过即 body_too_large（413，“太大不接受”），
+  在业务执行之前判定，超量字节绝不透传；带不带 Content-Length 结论一致；
+- 在途名额信号量限制并发缓冲总量；receive 超时 => body_receive_timeout；
+- 预取每个事件后重新读取策略快照：运行时调大/调小两个上限，对正在分段
+  送达的请求尚未读到的部分立即生效，不会一半旧策略一半新策略。
 
 运行时策略变更（不重启）：
 - GET/PUT /admin/policy：整体校验 + 原子替换 + 版本单调，与规则集同一语义；
-- 请求在进入防护时取一次 (rule_version, policy_version) 快照，整次处理
-  要么完整用旧配置，要么完整用新配置，不存在半更新/半旧半新。
+- 规则快照在判定时读取，整次规则求值对应同一个 rule_version；
+- 正文策略在预取的**每个事件后**重新取快照：整包请求读到的是进入时的策略，
+  分段/流式请求尚未读到的部分立即按新上限判定，结论携带最终适用的
+  policy_version，不会出现半旧半新。
 """
 
 from __future__ import annotations
@@ -223,8 +229,9 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
         headers = _headers_dict(headers_raw)
         method = scope.get("method", "GET").upper()
         query = _query_dict(scope)
-        # 进入防护即固定本次请求的策略快照；规则快照由引擎在判定时同次读取，
-        # 结论中的 rule_version / policy_version 即本次请求实际使用的版本。
+        # 进入防护先取一次策略快照（限流预检/在途名额阶段使用）；带正文请求
+        # 在预取中每个事件后还会通过 policy_store.snapshot() 重新取快照，
+        # 因此分段/流式送达的正文会即时按新上限判定（见 prefetch_body）。
         policy_version, policy = policy_store.snapshot()
 
         def features_from(summary: str) -> RequestFeatures:
@@ -295,18 +302,22 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
 
         try:
             try:
+                # policy_provider 让预取在每个事件后读取最新策略快照：
+                # 运行时调整 inspect/receive 上限后，正在分段送达的请求对
+                # 尚未读到的部分立即按新上限判定，不会半旧半新。
                 prefetch = await prefetch_body(
                     scope_headers=headers_raw,
                     receive=receive,
                     policy=policy,
                     receive_timeout_ms=config.body_receive_timeout_ms,
+                    policy_provider=policy_store.snapshot,
                 )
             except BodyTooLarge as exc:
                 outcome = engine.deny_body_stage(
                     features_from(""),
                     Reason.BODY_TOO_LARGE,
                     f"declared/received body {exc.received} exceeds receive_limit {exc.limit}",
-                    policy_version=policy_version,
+                    policy_version=exc.policy_version or policy_version,
                     body_meta={"declared": exc.received, "receive_limit": exc.limit},
                 )
                 await deny(outcome)
@@ -321,24 +332,30 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
                 await deny(outcome)
                 return
 
+            # 判定一律以预取结束时实际生效的策略快照为准（可能已被在线更新）。
+            final_policy = prefetch.policy
+            final_policy_version = prefetch.policy_version or policy_version
             summary = prefetch.inspected.decode("utf-8", "replace")
             body_meta = {
                 "content_length": prefetch.content_length,
                 "content_type": prefetch.content_type,
                 "inspected_bytes": len(prefetch.inspected),
+                "total_bytes": prefetch.total_bytes,
                 "exceeds_inspect_limit": prefetch.exceeds_inspect,
-                "inspect_limit": policy.inspect_limit,
-                "receive_limit": policy.receive_limit,
+                "inspect_limit": final_policy.inspect_limit,
+                "receive_limit": final_policy.receive_limit,
             }
 
-            # 4) 超过检查上限：默认 fail-closed（不猜测未检查部分）
-            if policy.content_check_enabled and prefetch.exceeds_inspect:
+            # 4) 超过检查上限：默认 fail-closed（不猜测未检查部分）。
+            #    预取已见到正文结束，因此该结论与整包/分片/流式送达无关，
+            #    写在检查范围之后的规则特征也不可能靠分片摆放绕过。
+            if final_policy.content_check_enabled and prefetch.exceeds_inspect:
                 outcome = engine.deny_body_stage(
                     features_from(summary),
                     Reason.CONTENT_INSPECTION_INCOMPLETE,
-                    f"body exceeds inspect_limit {policy.inspect_limit}; "
-                    "content verdict cannot be completed",
-                    policy_version=policy_version,
+                    f"body ({prefetch.total_bytes} bytes) exceeds inspect_limit "
+                    f"{final_policy.inspect_limit}; content verdict cannot be completed",
+                    policy_version=final_policy_version,
                     body_meta=body_meta,
                 )
                 await deny(outcome)
@@ -347,18 +364,21 @@ def create_app(config: DefenseConfig | None = None) -> FastAPI:
             # 5) 内容判定（开关关闭时 body 规则整体不参与）+ 其余特征规则
             outcome = engine.evaluate_rules(
                 features_from(summary),
-                policy_version=policy_version,
+                policy_version=final_policy_version,
                 body_meta=body_meta,
-                body_rule_scoped=not policy.content_check_enabled,
+                body_rule_scoped=not final_policy.content_check_enabled,
             )
             if outcome.decision is not Decision.ALLOW:
                 await deny(outcome)
                 return
 
-            # 6) 放行：原样重放预取事件，随后透传 receive；业务读到完整原始正文。
-            #    下游拉到预取窗口之外的数据后即可释放在途名额（继续透传只计量不缓冲）。
+            # 6) 放行：原样重放预取期间读到的全部事件（事件边界/more_body/
+            #    字节序与客户端发出完全一致），随后透传真实 receive；业务
+            #    读到完整原始正文。下游开始透传后即可释放在途名额。
             replay = make_replay_receive(
-                receive, prefetch.events, policy, on_drained=release_slot
+                receive, prefetch.events, final_policy,
+                on_drained=release_slot,
+                policy_version=final_policy_version,
             )
             await app_default(scope, replay, send)
         except Exception:  # noqa: BLE001 - 预取/判定/下游阶段的意外统一 500
